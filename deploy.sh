@@ -4,100 +4,223 @@
 # Author: Nicholas Ojinni
 # ============================================
 
-set -e
-LOG_FILE="deploy_$(date +%Y%m%d_%H%M%S).log"
-log(){ echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
-trap 'log "❌ ERROR on line $LINENO"; exit 1' ERR
+set -eu
+set -x
 
-read -p "Enter GitHub repo URL (https): " GIT_URL
-read -p "If repo is private enter PAT (or press Enter to skip): " PAT
-read -p "Enter branch name (default: main): " BRANCH
-read -p "Enter Remote Server Username (e.g., ubuntu): " SSH_USER
-read -p "Enter Remote Server IP Address: " SERVER_IP
-read -p "Enter path to SSH Key (e.g., ~/.ssh/hng-stage1-key.pem): " SSH_KEY
-read -p "Enter Application internal port (default: 80): " APP_PORT
+# Create timestamped log file
+LOGFILE="deploy_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "$LOGFILE") 2>&1
 
-BRANCH=${BRANCH:-main}
-APP_PORT=${APP_PORT:-80}
+# Error trap
+trap 'echo "[ERROR] Script failed at line $LINENO" >&2' ERR
 
-log "Cloning repository..."
-# prepare clone URL
-if [ -n "$PAT" ]; then
-  CLONE_URL=$(echo "$GIT_URL" | sed -e "s#https://##")
-  git clone -b "$BRANCH" "https://${PAT}@${CLONE_URL}" repo
-else
-  git clone -b "$BRANCH" "$GIT_URL" repo || { log "❌ Clone failed"; exit 1; }
-fi
-cd repo
+echo "[INFO] === STARTING DEPLOYMENT ==="
 
-# verify Dockerfile or docker-compose
-if [ -f "./Dockerfile" ]; then
-  log "✅ Dockerfile found"
-elif [ -f "./docker-compose.yml" ]; then
-  log "✅ docker-compose.yml found"
-else
-  log "❌ No Dockerfile or docker-compose.yml found in $(pwd)"
-  exit 1
+########################################
+# 1. Collect Parameters
+########################################
+
+echo "Git Repository URL:"
+read REPO_URL
+
+echo "Personal Access Token (PAT):"
+read PAT
+
+echo "Branch name [default: main]:"
+read BRANCH
+if [ -z "$BRANCH" ]; then
+  BRANCH="main"
 fi
 
-log "Testing SSH connection..."
-ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" "echo '✅ SSH connected successfully'"
+echo "Remote SSH Username:"
+read SSH_USER
 
-log "Preparing remote environment..."
-ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" <<'EOF'
-sudo apt update -y
-sudo apt install -y docker.io docker-compose-plugin nginx
-sudo usermod -aG docker $USER || true
-sudo systemctl enable --now docker nginx
+echo "Remote Server IP:"
+read SERVER_IP
+
+echo "SSH Key Path:"
+read SSH_KEY
+
+echo "Application internal port (e.g., 3000):"
+read APP_PORT
+
+# Extract repo name
+REPO_NAME=$(basename "$REPO_URL" .git)
+
+########################################
+# 2. Clone or Update Repository
+########################################
+
+if [ -d "$REPO_NAME" ]; then
+  echo "[INFO] Repo exists. Pulling latest changes..."
+  cd "$REPO_NAME"
+  git pull origin "$BRANCH"
+else
+  echo "[INFO] Cloning repository..."
+  git clone "https://${PAT}@${REPO_URL#https://}" --branch "$BRANCH"
+  cd "$REPO_NAME"
+fi
+
+########################################
+# 3. Verify Docker Config
+########################################
+
+if [ ! -f "Dockerfile" ] && [ ! -f "docker-compose.yml" ]; then
+  echo "[ERROR] No Docker configuration found."
+  exit 2
+fi
+
+########################################
+# 4. Test SSH Connection
+########################################
+
+echo "[INFO] Testing SSH connection..."
+ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" "echo 'SSH connection OK'" || exit 3
+
+########################################
+# 5. Prepare Remote Environment
+########################################
+
+ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" <<EOF
+set -eu
+echo "[INFO] Updating system..."
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y docker.io docker-compose nginx
+sudo usermod -aG docker \$USER
+sudo systemctl enable docker nginx
+sudo systemctl start docker nginx
 EOF
 
-log "Packaging app for transfer (excluding .git and logs)..."
-# create a tar excluding .git to copy
-cd ..
-tar --exclude='./repo/.git' --exclude='deploy_*.log' -czf app.tar.gz repo
+########################################
+# 6. Transfer Files
+########################################
 
-log "Transferring files to remote..."
-scp -i "$SSH_KEY" app.tar.gz "$SSH_USER@$SERVER_IP:/home/$SSH_USER/"
+echo "[INFO] Copying project files..."
+scp -i "$SSH_KEY" -r $(ls -A | grep -v -E 'node_modules|package.json|package-lock.json|.git') "$SSH_USER@$SERVER_IP:/home/$SSH_USER/$REPO_NAME"
 
-log "Deploying on remote..."
+########################################
+# 7. Deploy Application
+########################################
+
 ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" <<EOF
-cd /home/$SSH_USER
-mkdir -p app
-tar -xzf app.tar.gz -C app --strip-components=1
-cd app
-# if docker-compose file exists, prefer docker compose
-if [ -f docker-compose.yml ]; then
-  docker compose down || true
-  docker compose up -d --build
+cd "$REPO_NAME"
+if [ -f "docker-compose.yml" ]; then
+  echo "[INFO] Using docker-compose..."
+  docker-compose down
+  docker-compose up -d
 else
-  docker stop hng-app || true
-  docker rm hng-app || true
-  docker build -t hng-app .
-  docker run -d -p $APP_PORT:$APP_PORT --name hng-app hng-app
+  echo "[INFO] Building Docker image..."
+  docker stop app 2>/dev/null || true
+  docker rm -f app 2>/dev/null || true
+  docker build -t app .
+  docker run -d --name app -p $APP_PORT:$APP_PORT app
 fi
 EOF
 
-log "Configuring Nginx reverse proxy..."
+########################################
+# 8. Configure Nginx
+########################################
+
 ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" <<EOF
-sudo bash -c 'cat > /etc/nginx/sites-available/hng_app <<EOL
+sudo sh -c 'cat > /etc/nginx/sites-available/app.conf' <<NGINX
 server {
-    listen 80;
-    server_name _;
-    location / {
-        proxy_pass http://localhost:$APP_PORT;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-    }
+  listen 80;
+  location / {
+    proxy_pass http://localhost:$APP_PORT;
+  }
 }
-EOL'
-sudo ln -sf /etc/nginx/sites-available/hng_app /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
+NGINX
+sudo ln -sf /etc/nginx/sites-available/app.conf /etc/nginx/sites-enabled/app.conf
+sudo nginx -t
+sudo systemctl restart nginx
 EOF
 
-log "Validating deployment..."
+########################################
+# 9. Optional: Enable SSL (Certbot or Self-signed)
+########################################
+
+echo "Enable SSL? (y/n)"
+read ENABLE_SSL
+
+if [ "$ENABLE_SSL" = "y" ] || [ "$ENABLE_SSL" = "Y" ]; then
+  echo "Domain name for SSL (e.g., example.com):"
+  read DOMAIN_NAME
+
+  echo "Use certbot (recommended) or self-signed? [certbot/self]"
+  read SSL_TYPE
+
+  echo "[INFO] Setting up SSL on remote server..."
+
+  ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" <<EOF
+set -eu
+
+# install required packages
+sudo apt update -y
+sudo apt install -y openssl certbot python3-certbot-nginx
+
+if [ "$SSL_TYPE" = "certbot" ]; then
+  echo "[INFO] Requesting LetsEncrypt cert for $DOMAIN_NAME..."
+  # certbot will attempt to obtain and install the cert via nginx plugin
+  # this requires the domain to point to the server and ports 80/443 available
+  sudo certbot --nginx -d $DOMAIN_NAME --non-interactive --agree-tos -m admin@$DOMAIN_NAME || echo "[WARN] Certbot step failed - check DNS or open ports 80/443"
+else
+  echo "[INFO] Generating self-signed cert for $DOMAIN_NAME..."
+  sudo mkdir -p /etc/ssl/selfsigned
+  sudo openssl req -x509 -nodes -days 365 \
+    -subj "/CN=$DOMAIN_NAME" \
+    -newkey rsa:2048 \
+    -keyout /etc/ssl/selfsigned/$DOMAIN_NAME.key \
+    -out /etc/ssl/selfsigned/$DOMAIN_NAME.crt
+
+  # write nginx config for HTTPS (redirect http -> https)
+  sudo sh -c 'cat > /etc/nginx/sites-available/app.conf' <<NGINX
+server {
+  listen 80;
+  server_name $DOMAIN_NAME;
+  return 301 https://\$host\$request_uri;
+}
+server {
+  listen 443 ssl;
+  server_name $DOMAIN_NAME;
+
+  ssl_certificate     /etc/ssl/selfsigned/$DOMAIN_NAME.crt;
+  ssl_certificate_key /etc/ssl/selfsigned/$DOMAIN_NAME.key;
+
+  location / {
+    proxy_pass http://localhost:$APP_PORT;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+  }
+}
+NGINX
+fi
+
+# test and reload nginx
+sudo nginx -t
+sudo systemctl restart nginx
+
+EOF
+
+  echo "[INFO] SSL setup attempted for $DOMAIN_NAME (type: $SSL_TYPE)"
+else
+  echo "[INFO] Skipping SSL setup."
+fi
+
+
+########################################
+# 10. Final Checks
+########################################
+
 ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" <<EOF
-docker ps
-curl -I localhost || true
+echo "[INFO] Docker containers:"
+echo "[INFO] Docker images:"
+docker images
+echo "[INFO] Docker ps:"
+docker ps 
+echo "[INFO] Docker Logs:"
+docker logs app || true
+echo "[INFO] Checking app response..."
+curl -I http://localhost:$APP_PORT || true
 EOF
 
-log "✅ Deployment completed successfully!"
+echo "[SUCCESS] Deployment completed successfully."
