@@ -24,10 +24,10 @@ I'm learning how to approach DevOps tasks with practical, hands-on projects, and
 
 ## 👤 Author
 
-**Name:** Ojinni Oluwafemi Nicholas  
-**Slack Username:** @OjinniNicholas  
+**Name:** Nicholas Ojinni  
+**Slack Username:** @St-Nicholas  
 **Track:** DevOps  
-**GitHub:** [https://github.com/ojinninicholas](https://github.com/ojinninicholas)  
+**GitHub:** [https://github.com/Nicholasojinni](https://github.com/Nicholasojinni)  
 **Email:** ojinnin@gmail.com  
 
 ---
