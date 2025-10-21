@@ -132,7 +132,7 @@ else
   docker stop app 2>/dev/null || true
   docker rm -f app 2>/dev/null || true
   docker build -t app .
-  docker run -d --name app -p $APP_PORT:$APP_PORT app
+  docker run -d --name app -p 8080:80 app
 fi
 EOF
 
@@ -145,7 +145,7 @@ sudo sh -c 'cat > /etc/nginx/sites-available/app.conf' <<NGINX
 server {
   listen 80;
   location / {
-    proxy_pass http://localhost:$APP_PORT;
+    proxy_pass http://localhost:8080;
   }
 }
 NGINX
