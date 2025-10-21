@@ -1,0 +1,3 @@
+Slack Email: ojinnin@gmail.com
+Slack Username: @St-Nicholas
+Experience: I am learning DevOps through hands-on projects and this deployment script demonstrates automated Docker deployment and reverse-proxy setup.
