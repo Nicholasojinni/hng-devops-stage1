@@ -85,7 +85,26 @@ ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" <<EOF
 set -eu
 echo "[INFO] Updating system..."
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y docker.io docker-compose nginx
+
+echo "[INFO] Installing dependencies..."
+sudo apt install -y ca-certificates curl gnupg nginx
+
+echo "[INFO] Adding Docker’s official GPG key..."
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+echo "[INFO] Setting up Docker repository..."
+echo \
+  "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+  https://download.docker.com/linux/ubuntu \$(. /etc/os-release && echo \$VERSION_CODENAME) stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+echo "[INFO] Installing Docker..."
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+echo "[INFO] Enabling and starting Docker & Nginx..."
 sudo usermod -aG docker \$USER
 sudo systemctl enable docker nginx
 sudo systemctl start docker nginx
